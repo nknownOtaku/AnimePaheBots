@@ -46,11 +46,8 @@ async def send_progress(text: str):
             print(f"[Progress] Failed to send: {e}")
 
 def extract_embed_and_info(animepahe_url: str) -> tuple[str, str, str]:
-    """
-    Returns: (embed_url, anime_title, real_episode_number)    """
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(animepahe_url, headers=headers, timeout=15)
-    resp.raise_for_status()
+    resp = requests.get(animepahe_url, headers=headers, timeout=15)    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
     iframe = soup.find("iframe", src=True)
@@ -97,15 +94,114 @@ async def process_download_queue():
         finally:
             is_downloading = False
             download_queue.task_done()
+
 async def _download_episode(client: Client, message: Message, anime_url: str):
-    try:
-        await send_progress(f"🔍 Parsing episode info from {anime_url}")
-        embed_url, raw_title, ep_num = extract_embed_and_info(anime_url)
+    try:        await send_progress(f"🔍 Parsing episode info from {anime_url}")
+        embed_url, raw_title, ep_num = extract_embed_and_info(animepahe_url)
         clean_title = re.sub(r'[<>:"/\\|?*]', '_', raw_title)
         base_name = f"{clean_title} - Episode {ep_num}"
 
         await send_progress(f"🎬 Found: {base_name}")
 
+        with YoutubeDL({"quiet": True}) as ydl:
+            info = ydl.extract_info(embed_url, download=False)
+            duration = info.get("duration", 0)
+
+        if duration > 10800:
+            await message.reply_text("⚠️ Video too long—skipping.")
+            return
+
+        success = False
+        filename = None
+        for res in ["480", "720", "1080"]:
+            episode_key = f"{clean_title}_{ep_num}_{res}"
+            if episode_key in downloaded_episodes:
+                await send_progress(f"⏭️ Already downloaded: {episode_key}")
+                continue
+
+            filename = os.path.join(DOWNLOAD_DIR, f"{base_name} [{res}p].mp4")
+
+            with YoutubeDL({"quiet": True}) as ydl:
+                info = ydl.extract_info(embed_url, download=False)
+                filesize = info.get("filesize") or info.get("filesize_approx") or 0
+                filesize_mb = filesize / (1024 * 1024)
+
+            if filesize_mb > MAX_FILE_MB:
+                await send_progress(f"❌ {res}p too large ({filesize_mb:.1f} MB)")
+                continue
+
+            await send_progress(f"📥 Downloading {base_name} [{res}p]...")
+            ydl_opts = {
+                "format": f"bestvideo[height<={res}]+bestaudio/best[height<={res}]",
+                "outtmpl": filename,
+                "noplaylist": True,
+                "quiet": False,
+                "geo_bypass": True,
+                "socket_timeout": 20,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([embed_url])
+
+            if not os.path.exists(filename):
+                await send_progress("❗ File not created")
+                continue
+            final_size_mb = os.path.getsize(filename) / (1024 * 1024)
+            await send_progress(f"📤 Sending {base_name} [{res}p]...")
+
+            await message.reply_document(
+                document=filename,
+                caption=f"✅ {base_name}\nResolution: {res}p\nSize: {final_size_mb:.1f} MB",
+                force_document=True
+            )
+
+            try:
+                os.remove(filename)
+                await send_progress("🗑️ File deleted after upload.")
+            except Exception as e:
+                await send_progress(f"⚠️ Failed to delete file: {e}")
+
+            downloaded_episodes.add(episode_key)
+            save_duplicate_log()
+            success = True
+            break
+
+        if not success:
+            await message.reply_text("❌ All resolutions skipped (too large or already downloaded).")
+            if filename and os.path.exists(filename):
+                os.remove(filename)
+
+    except Exception as e:
+        if 'filename' in locals() and os.path.exists(filename):
+            os.remove(filename)
+        raise e
+
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message):
+    await message.reply_text(
+        "👋 Send:\n`/download <AnimePahe episode URL>`\n"
+        "Episodes are processed one-by-one. Files auto-deleted after upload."
+    )
+
+@app.on_message(filters.command("download") & filters.private)
+async def manual_download(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("UsageId: `/download <AnimePahe episode URL>`")
+        return
+
+    url = message.command[1]
+    if "animepahe" not in url:
+        await message.reply_text("⚠️ Only AnimePahe URLs supported.")
+        return
+
+    await message.reply_text("✅ Added to queue. Processing one at a time...")
+    await download_queue.put((client, message, url))
+
+    if not any(t.get_name() == "QueueProcessor" for t in asyncio.all_tasks()):
+        asyncio.create_task(process_download_queue(), name="QueueProcessor")
+
+if __name__ == "__main__":
+    print("🚀 Bot starting (1GB-safe mode)...")
+    app.run()
         with YoutubeDL({"quiet": True}) as ydl:
             info = ydl.extract_info(embed_url, download=False)
             duration = info.get("duration", 0)
