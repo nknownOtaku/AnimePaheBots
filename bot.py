@@ -1,110 +1,159 @@
 import os
 import asyncio
-import requests
-import subprocess
-from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+import json
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import yt_dlp
+from datetime import datetime
 
-# ================= CONFIG =================
-
+# =====================
+# ENV CONFIG
+# =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 
-MAIN_CHANNEL = int(os.getenv("MAIN_CHANNEL"))
+MAIN_CHANNEL = int(os.getenv("MAIN_CHANNEL"))  # e.g., -1001234567890
 PROGRESS_CHANNEL = int(os.getenv("PROGRESS_CHANNEL"))
 
-MONGO_URI = os.getenv("MONGO_URI")
-
-MAX_FILE_MB = 700
-SOURCE = "animepahe"
-
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 700))
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= MONGO =================
+DB_FILE = "downloads.json"
 
-mongo = MongoClient(MONGO_URI)
-db = mongo["otaku_syndicate"]
-episodes_col = db["episodes"]
+# =====================
+# LOAD LOCAL DB
+# =====================
+if os.path.exists(DB_FILE):
+    with open(DB_FILE, "r") as f:
+        db = json.load(f)
+else:
+    db = {"episodes": []}
 
-episodes_col.create_index(
-    [("anime_id", ASCENDING),
-     ("episode", ASCENDING),
-     ("resolution", ASCENDING),
-     ("source", ASCENDING)],
-    unique=True
-)
+def save_db():
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2)
 
-# ================= TELEGRAM =================
-
-app = Client("otaku_syndicate", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# ================= QUEUE =================
-
-download_queue = asyncio.Queue()
-
-# ================= HELPERS =================
-
-def is_duplicate(anime_id, episode, resolution):
-    return episodes_col.find_one({
-        "anime_id": anime_id,
-        "episode": episode,
-        "resolution": resolution,
-        "source": SOURCE
-    }) is not None
-
-
-def mark_processed(anime_id, anime_title, episode, resolution, file_size):
-    episodes_col.insert_one({
-        "anime_id": anime_id,
-        "anime_title": anime_title,
-        "episode": episode,
-        "resolution": resolution,
-        "file_size": file_size,
-        "source": SOURCE,
-        "uploaded_at": datetime.utcnow()
-    })
-
-
-def get_file_size_mb(path):
-    return os.path.getsize(path) / 1024 / 1024
-
-
-# ================= DOWNLOAD WORKER =================
-
-async def queue_worker():
-    while True:
-        job = await download_queue.get()
-        try:
-            await process_job(job)
-        except Exception as e:
-            print("Job error:", e)
-        download_queue.task_done()
-
-
-# ================= CORE JOB =================
-
-async def process_job(job):
-    anime_id = job["anime_id"]
-    anime_title = job["anime_title"]
-    episode = job["episode"]
-    sources = job["sources"]
-
-    progress_msg = await app.send_message(
-        PROGRESS_CHANNEL,
-        f"⬇️ Starting\n{anime_title}\nEp {episode}"
+def is_duplicate(anime_id, episode, quality):
+    return any(
+        e["anime_id"] == anime_id and e["episode"] == episode and e["quality"] == quality
+        for e in db["episodes"]
     )
 
-    for src in sources:
-        url = src["url"]
-        resolution = str(src["quality"])
+def add_episode(anime_id, episode, quality, filename):
+    db["episodes"].append({
+        "anime_id": anime_id,
+        "episode": episode,
+        "quality": quality,
+        "filename": filename,
+        "timestamp": str(datetime.utcnow())
+    })
+    save_db()
 
-        if is_duplicate(anime_id, episode, resolution):
+# =====================
+# DOWNLOAD QUEUE
+# =====================
+download_queue = asyncio.Queue()
+is_downloading = False
+
+async def process_queue(client):
+    global is_downloading
+    while True:
+        anime_id, episode, url = await download_queue.get()
+        is_downloading = True
+        # Download qualities sequentially
+        for quality in ["480p", "720p", "1080p"]:
+            await download_episode(client, anime_id, episode, url, quality)
+        is_downloading = False
+        download_queue.task_done()
+
+# =====================
+# DOWNLOAD FUNCTION
+# =====================
+async def download_episode(client, anime_id, episode, url, quality):
+    if is_duplicate(anime_id, episode, quality):
+        await client.send_message(PROGRESS_CHANNEL, f"⚠️ Episode {episode} {quality} already downloaded.")
+        return
+
+    await client.send_message(PROGRESS_CHANNEL, f"⬇️ Downloading Episode {episode} - {quality}...")
+
+    ydl_opts = {
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f'{anime_id}_EP{episode}_{quality}.%(ext)s'),
+        'noplaylist': True,
+        'progress_hooks': [lambda d: asyncio.create_task(progress_hook(client, anime_id, episode, quality, d))],
+        'quiet': True,
+        'format': f'bestvideo[height<={quality[:-1]}]+bestaudio/best'
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filesize_mb = info.get('filesize', 0) / (1024*1024)
+            if filesize_mb > MAX_FILE_MB:
+                await client.send_message(PROGRESS_CHANNEL, f"⚠️ Skipped Episode {episode} {quality} (>{MAX_FILE_MB}MB).")
+                return
+            filename = ydl.prepare_filename(info)
+            add_episode(anime_id, episode, quality, filename)
+            await client.send_message(PROGRESS_CHANNEL, f"✅ Downloaded Episode {episode} {quality}: {filename}")
+            # Upload to main channel
+            await client.send_document(MAIN_CHANNEL, filename, caption=f"Episode {episode} - {quality}")
+    except Exception as e:
+        await client.send_message(PROGRESS_CHANNEL, f"❌ Failed Episode {episode} {quality}: {e}")
+
+async def progress_hook(client, anime_id, episode, quality, d):
+    if d['status'] == 'downloading':
+        percent = d.get('_percent_str', '0.0%')
+        speed = d.get('_speed_str', '0 B/s')
+        await client.send_message(PROGRESS_CHANNEL, f"⬇️ EP{episode} {quality} Downloading: {percent} at {speed}")
+
+# =====================
+# TELEGRAM BOT
+# =====================
+app = Client("anime_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+
+@app.on_message(filters.command("start"))
+async def start(_, message):
+    await message.reply_text("👋 Anime Downloader Bot is online.\nUse /download to download manually.")
+
+@app.on_message(filters.command("download"))
+async def manual_download(_, message):
+    try:
+        args = message.text.split(maxsplit=3)
+        anime_id = args[1]
+        episode = args[2]
+        url = args[3]
+    except:
+        await message.reply_text("Usage: /download <anime_id> <episode> <url>")
+        return
+
+    await download_queue.put((anime_id, episode, url))
+    await message.reply_text(f"✅ Added Episode {episode} to download queue (480p → 720p → 1080p).")
+
+@app.on_message(filters.command("status"))
+async def status(_, message):
+    status_msg = "⏳ Download Queue:\n"
+    queue_list = list(download_queue._queue)
+    for i, item in enumerate(queue_list, 1):
+        status_msg += f"{i}. Anime: {item[0]}, Episode: {item[1]}\n"
+    status_msg += f"\nCurrently Downloading: {'Yes' if is_downloading else 'No'}"
+    await message.reply_text(status_msg)
+
+# =====================
+# START BOT
+# =====================
+async def main():
+    asyncio.create_task(process_queue(app))
+    await app.start()
+    print("Bot started...")
+    from pyrogram import idle
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())        if is_duplicate(anime_id, episode, resolution):
             continue
 
         filename = f"{anime_title} - Ep{episode} [{resolution}].mp4"
