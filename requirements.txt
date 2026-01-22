@@ -1,0 +1,7 @@
+pyrogram
+tgcrypto
+pymongo
+requests
+apscheduler
+yt-dlp
+python-dotenv
