@@ -1,7 +1,5 @@
-pyrogram
-tgcrypto
-pymongo
-requests
-apscheduler
-yt-dlp
-python-dotenv
+pyrogram==2.0.106
+tgcrypto==1.2.5
+yt-dlp==2025.12.8
+python-dotenv==1.2.1
+nest-asyncio==1.5.8
